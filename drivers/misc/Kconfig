@@ -557,6 +557,13 @@ config UID_SYS_STATS
 	  Per UID based io statistics exported to /proc/uid_io
 	  Per UID based procstat control in /proc/uid_procstat
 
+#add by xcb
+config BOOTLOADER_LOG
+	tristate "show bootloader log"
+	depends on OF
+	default y
+	help
+	  show bootloader log in kernel
 config QPNP_MISC
 	tristate "QPNP Misc Peripheral"
 	depends on SPMI || MSM_SPMI

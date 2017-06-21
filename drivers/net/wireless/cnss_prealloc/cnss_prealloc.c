@@ -225,8 +225,6 @@ void wcnss_prealloc_check_memory_leak(void)
 	}
 
 }
-#else
-void wcnss_prealloc_check_memory_leak(void) {}
 #endif
 EXPORT_SYMBOL(wcnss_prealloc_check_memory_leak);
 

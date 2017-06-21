@@ -3697,6 +3697,7 @@ void ipa_suspend_handler(enum ipa_irq_type interrupt,
 						&ipa_ctx->sps_pm.dec_clients,
 						1);
 					ipa_sps_process_irq_schedule_rel();
+				mutex_unlock(&ipa_ctx->sps_pm.sps_pm_lock);
 				}
 				mutex_unlock(&ipa_ctx->sps_pm.sps_pm_lock);
 			} else {
