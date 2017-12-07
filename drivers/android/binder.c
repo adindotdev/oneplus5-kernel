@@ -2942,7 +2942,7 @@ retry:
 				cmd = BR_CLEAR_DEATH_NOTIFICATION_DONE;
 			else
 				cmd = BR_DEAD_BINDER;
-				if (put_user_preempt_disabled(cmd, (uint32_t __user *) ptr))
+			if (put_user_preempt_disabled(cmd, (uint32_t __user *) ptr))
 				return -EFAULT;
 			ptr += sizeof(uint32_t);
 			if (put_user_preempt_disabled(death->cookie, (binder_uintptr_t __user *) ptr))
@@ -3449,7 +3449,7 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 	const char *failure_string;
 	struct binder_buffer *buffer;
 
-	if (proc->tsk != current)
+	if (proc->tsk != current->group_leader)
 		return -EINVAL;
 
 	if ((vma->vm_end - vma->vm_start) > SZ_4M)

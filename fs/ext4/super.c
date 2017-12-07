@@ -793,6 +793,7 @@ static void ext4_put_super(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_super_block *es = sbi->s_es;
+	int aborted = 0;
 	int i, err;
 
 	ext4_unregister_li_request(sb);
@@ -802,9 +803,10 @@ static void ext4_put_super(struct super_block *sb)
 	destroy_workqueue(sbi->rsv_conversion_wq);
 
 	if (sbi->s_journal) {
+		aborted = is_journal_aborted(sbi->s_journal);
 		err = jbd2_journal_destroy(sbi->s_journal);
 		sbi->s_journal = NULL;
-		if (err < 0)
+		if ((err < 0) && !aborted)
 			ext4_abort(sb, "Couldn't clean up the journal");
 	}
 
@@ -816,7 +818,7 @@ static void ext4_put_super(struct super_block *sb)
 	ext4_ext_release(sb);
 	ext4_xattr_put_super(sb);
 
-	if (!(sb->s_flags & MS_RDONLY)) {
+	if (!(sb->s_flags & MS_RDONLY) && !aborted) {
 		ext4_clear_feature_journal_needs_recovery(sb);
 		es->s_state = cpu_to_le16(sbi->s_mount_state);
 	}
@@ -2203,6 +2205,7 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 	unsigned int s_flags = sb->s_flags;
 	int nr_orphans = 0, nr_truncates = 0;
 #ifdef CONFIG_QUOTA
+	int quota_update = 0;
 	int i;
 #endif
 	if (!es->s_last_orphan) {
@@ -2241,14 +2244,32 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 #ifdef CONFIG_QUOTA
 	/* Needed for iput() to work correctly and not trash data */
 	sb->s_flags |= MS_ACTIVE;
-	/* Turn on quotas so that they are updated correctly */
+
+	/*
+	 * Turn on quotas which were not enabled for read-only mounts if
+	 * filesystem has quota feature, so that they are updated correctly.
+	 */
+	if (ext4_has_feature_quota(sb) && (s_flags & MS_RDONLY)) {
+		int ret = ext4_enable_quotas(sb);
+
+		if (!ret)
+			quota_update = 1;
+		else
+			ext4_msg(sb, KERN_ERR,
+				"Cannot turn on quotas: error %d", ret);
+	}
+
+	/* Turn on journaled quotas used for old sytle */
 	for (i = 0; i < EXT4_MAXQUOTAS; i++) {
 		if (EXT4_SB(sb)->s_qf_names[i]) {
 			int ret = ext4_quota_on_mount(sb, i);
-			if (ret < 0)
+
+			if (!ret)
+				quota_update = 1;
+			else
 				ext4_msg(sb, KERN_ERR,
 					"Cannot turn on journaled "
-					"quota: error %d", ret);
+					"quota: type %d: error %d", i, ret);
 		}
 	}
 #endif
@@ -2307,10 +2328,12 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 		ext4_msg(sb, KERN_INFO, "%d truncate%s cleaned up",
 		       PLURAL(nr_truncates));
 #ifdef CONFIG_QUOTA
-	/* Turn quotas off */
-	for (i = 0; i < EXT4_MAXQUOTAS; i++) {
-		if (sb_dqopt(sb)->files[i])
-			dquot_quota_off(sb, i);
+	/* Turn off quotas if they were enabled for orphan cleanup */
+	if (quota_update) {
+		for (i = 0; i < EXT4_MAXQUOTAS; i++) {
+			if (sb_dqopt(sb)->files[i])
+				dquot_quota_off(sb, i);
+		}
 	}
 #endif
 	sb->s_flags = s_flags; /* Restore MS_RDONLY status */
@@ -2476,9 +2499,9 @@ static unsigned long ext4_get_stripe_size(struct ext4_sb_info *sbi)
 
 	if (sbi->s_stripe && sbi->s_stripe <= sbi->s_blocks_per_group)
 		ret = sbi->s_stripe;
-	else if (stripe_width <= sbi->s_blocks_per_group)
+	else if (stripe_width && stripe_width <= sbi->s_blocks_per_group)
 		ret = stripe_width;
-	else if (stride <= sbi->s_blocks_per_group)
+	else if (stride && stride <= sbi->s_blocks_per_group)
 		ret = stride;
 	else
 		ret = 0;
@@ -3037,10 +3060,15 @@ static int count_overhead(struct super_block *sb, ext4_group_t grp,
 			ext4_set_bit(s++, buf);
 			count++;
 		}
-		for (j = ext4_bg_num_gdb(sb, grp); j > 0; j--) {
-			ext4_set_bit(EXT4_B2C(sbi, s++), buf);
-			count++;
+		j = ext4_bg_num_gdb(sb, grp);
+		if (s + j > EXT4_BLOCKS_PER_GROUP(sb)) {
+			ext4_error(sb, "Invalid number of block group "
+				   "descriptor blocks: %d", j);
+			j = EXT4_BLOCKS_PER_GROUP(sb) - s;
 		}
+		count += j;
+		for (; j > 0; j--)
+			ext4_set_bit(EXT4_B2C(sbi, s++), buf);
 	}
 	if (!count)
 		return 0;
@@ -3340,6 +3368,11 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 				 "both data=journal and dax");
 			goto failed_mount;
 		}
+		if (ext4_has_feature_encrypt(sb)) {
+			ext4_msg(sb, KERN_WARNING,
+				 "encrypted files will use data=ordered "
+				 "instead of data journaling mode");
+		}
 		if (test_opt(sb, DELALLOC))
 			clear_opt(sb, DELALLOC);
 	} else {
@@ -3400,7 +3433,15 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	if (blocksize < EXT4_MIN_BLOCK_SIZE ||
 	    blocksize > EXT4_MAX_BLOCK_SIZE) {
 		ext4_msg(sb, KERN_ERR,
-		       "Unsupported filesystem blocksize %d", blocksize);
+		       "Unsupported filesystem blocksize %d (%d log_block_size)",
+			 blocksize, le32_to_cpu(es->s_log_block_size));
+		goto failed_mount;
+	}
+	if (le32_to_cpu(es->s_log_block_size) >
+	    (EXT4_MAX_BLOCK_LOG_SIZE - EXT4_MIN_BLOCK_LOG_SIZE)) {
+		ext4_msg(sb, KERN_ERR,
+			 "Invalid log block size: %u",
+			 le32_to_cpu(es->s_log_block_size));
 		goto failed_mount;
 	}
 
@@ -3494,12 +3535,16 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 
 	sbi->s_blocks_per_group = le32_to_cpu(es->s_blocks_per_group);
 	sbi->s_inodes_per_group = le32_to_cpu(es->s_inodes_per_group);
-	if (EXT4_INODE_SIZE(sb) == 0 || EXT4_INODES_PER_GROUP(sb) == 0)
-		goto cantfind_ext4;
 
 	sbi->s_inodes_per_block = blocksize / EXT4_INODE_SIZE(sb);
 	if (sbi->s_inodes_per_block == 0)
 		goto cantfind_ext4;
+	if (sbi->s_inodes_per_group < sbi->s_inodes_per_block ||
+	    sbi->s_inodes_per_group > blocksize * 8) {
+		ext4_msg(sb, KERN_ERR, "invalid inodes per group: %lu\n",
+			 sbi->s_blocks_per_group);
+		goto failed_mount;
+	}
 	sbi->s_itb_per_group = sbi->s_inodes_per_group /
 					sbi->s_inodes_per_block;
 	sbi->s_desc_per_block = blocksize / EXT4_DESC_SIZE(sb);
@@ -3539,6 +3584,13 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 				 "block size (%d)", clustersize, blocksize);
 			goto failed_mount;
 		}
+		if (le32_to_cpu(es->s_log_cluster_size) >
+		    (EXT4_MAX_CLUSTER_LOG_SIZE - EXT4_MIN_BLOCK_LOG_SIZE)) {
+			ext4_msg(sb, KERN_ERR,
+				 "Invalid log cluster size: %u",
+				 le32_to_cpu(es->s_log_cluster_size));
+			goto failed_mount;
+		}
 		sbi->s_cluster_bits = le32_to_cpu(es->s_log_cluster_size) -
 			le32_to_cpu(es->s_log_block_size);
 		sbi->s_clusters_per_group =
@@ -3574,13 +3626,6 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 		sbi->s_cluster_bits = 0;
 	}
 	sbi->s_cluster_ratio = clustersize / blocksize;
-
-	if (sbi->s_inodes_per_group > blocksize * 8) {
-		ext4_msg(sb, KERN_ERR,
-		       "#inodes per group too big: %lu",
-		       sbi->s_inodes_per_group);
-		goto failed_mount;
-	}
 
 	/* Do we have standard group size of clustersize * 8 blocks ? */
 	if (sbi->s_blocks_per_group == clustersize << 3)
@@ -3641,6 +3686,15 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 			(EXT4_MAX_BLOCK_FILE_PHYS / EXT4_BLOCKS_PER_GROUP(sb)));
 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
 		   EXT4_DESC_PER_BLOCK(sb);
+	if (ext4_has_feature_meta_bg(sb)) {
+		if (le32_to_cpu(es->s_first_meta_bg) > db_count) {
+			ext4_msg(sb, KERN_WARNING,
+				 "first meta block group too large: %u "
+				 "(group descriptor block count %u)",
+				 le32_to_cpu(es->s_first_meta_bg), db_count);
+			goto failed_mount;
+		}
+	}
 	sbi->s_group_desc = ext4_kvmalloc(db_count *
 					  sizeof(struct buffer_head *),
 					  GFP_KERNEL);
@@ -3715,7 +3769,8 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 	 * root first: it may be modified in the journal!
 	 */
 	if (!test_opt(sb, NOLOAD) && ext4_has_feature_journal(sb)) {
-		if (ext4_load_journal(sb, es, journal_devnum))
+		err = ext4_load_journal(sb, es, journal_devnum);
+		if (err)
 			goto failed_mount3a;
 	} else if (test_opt(sb, NOLOAD) && !(sb->s_flags & MS_RDONLY) &&
 		   ext4_has_feature_journal_needs_recovery(sb)) {
@@ -5086,6 +5141,9 @@ static int ext4_enable_quotas(struct super_block *sb)
 			err = ext4_quota_enable(sb, type, QFMT_VFS_V1,
 						DQUOT_USAGE_ENABLED);
 			if (err) {
+				for (type--; type >= 0; type--)
+					dquot_quota_off(sb, type);
+
 				ext4_warning(sb,
 					"Failed to enable quota tracking "
 					"(type=%d, err=%d). Please run "
