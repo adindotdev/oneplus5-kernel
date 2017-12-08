@@ -1581,7 +1581,7 @@ int __init_memblock memblock_overlaps_memory(phys_addr_t base, phys_addr_t size)
 {
 	memblock_cap_size(base, &size);
 
-	return memblock_overlaps_region(&memblock.memory, base, size) >= 0;
+	return memblock_overlaps_region(&memblock.memory, base, size);
 }
 
 /**
@@ -1658,6 +1658,30 @@ static void __init_memblock memblock_dump(struct memblock_type *type, char *name
 		pr_info(" %s[%#x]\t[%#016llx-%#016llx], %#llx bytes%s flags: %#lx\n",
 			name, i, base, base + size - 1, size, nid_buf, flags);
 	}
+}
+
+extern unsigned long __init_memblock
+memblock_reserved_memory_within(phys_addr_t start_addr, phys_addr_t end_addr)
+{
+	struct memblock_type *type = &memblock.reserved;
+	unsigned long size = 0;
+	int idx;
+
+	for (idx = 0; idx < type->cnt; idx++) {
+		struct memblock_region *rgn = &type->regions[idx];
+		phys_addr_t start, end;
+
+		if (rgn->base + rgn->size < start_addr)
+			continue;
+		if (rgn->base > end_addr)
+			continue;
+
+		start = rgn->base;
+		end = start + rgn->size;
+		size += end - start;
+	}
+
+	return size;
 }
 
 void __init_memblock __memblock_dump_all(void)
